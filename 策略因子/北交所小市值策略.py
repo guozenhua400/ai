@@ -1,4 +1,4 @@
- # coding:gbk
+# coding:gbk
 """
 北交所小市值多因子选股QMT策略
 版本：2.0
@@ -578,38 +578,31 @@ def select_stocks(C):
     
     log_message("INFO", f"开始获取 {step5_start} 只股票的换手率数据...")
     
-    # 先下载历史数据
-    try:
-        import datetime
-        end_date = datetime.datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y%m%d")
-        
-        download_stocks = filtered[:100] if step5_start > 100 else filtered
-        for stock in download_stocks:
-            try:
-                download_history_data(stock, '1d', start_date, end_date)
-            except Exception as e:
-                log_message("WARN", f"下载股票 {stock} 换手率历史数据失败: {str(e)}")
-        log_message("DEBUG", "成功下载换手率计算所需的历史数据")
-    except Exception as e:
-        log_message("WARN", f"下载换手率历史数据失败: {str(e)}")
-    
-    # 批量获取换手率数据
+    # 批量获取换手率数据（使用正确的计算方法：成交量/流通股本）
     try:
         if step5_start <= 100:  # 小批量直接获取
-            detail = C.get_market_data_ex(['turnoverRate'], filtered, period='1d', count=1, subscribe=False)
+            # 获取成交量和流通股本数据（count=2获取最近两天，使用[-2]获取昨天数据）
+            detail = C.get_market_data_ex(['volume'], filtered, period='1d', count=2, subscribe=False)
             for stock in filtered:
                 try:
-                    if stock in detail and len(detail[stock]) > 0:
-                        turnover = detail[stock]['turnoverRate'].iloc[-1] if not detail[stock]['turnoverRate'].empty else 0
-                        if turnover > 0:
-                            turnover_dict[stock] = turnover
+                    # 获取流通股本
+                    instrument_detail = C.get_instrument_detail(stock)
+                    float_volume = instrument_detail.get('FloatVolume', 0)  # 流通股本
+                    
+                    if stock in detail and len(detail[stock]) >= 2:  # 确保至少有两天数据
+                        volume = detail[stock]['volume'].iloc[-2] if not detail[stock]['volume'].empty else 0
+                        
+                        # 计算换手率：成交量*100 / 流通股本
+                        if float_volume > 0 and volume > 0:
+                            turnover_rate = (volume*100 / float_volume)
+                            turnover_dict[stock] = turnover_rate
                         else:
                             turnover_error_count += 1
+                            log_message("WARN", f"股票 {stock} 流通股本或成交量为0，无法计算换手率")
                     else:
                         turnover_error_count += 1
                 except Exception as e:
-                    log_message("WARN", f"获取股票 {stock} 换手率时异常: {str(e)}")
+                    log_message("WARN", f"计算股票 {stock} 换手率时异常: {str(e)}")
                     turnover_error_count += 1
         else:
             # 大批量分批处理
@@ -618,24 +611,24 @@ def select_stocks(C):
                 batch = filtered[i:i+batch_size]
                 log_message("DEBUG", f"处理换手率数据批次: {i//batch_size + 1}/{(step5_start-1)//batch_size + 1}")
                 try:
-                    # 先下载这批股票的历史数据
-                    import datetime
-                    end_date = datetime.datetime.now().strftime("%Y%m%d")
-                    start_date = (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y%m%d")
+                    # 获取成交量和流通股本数据（count=2获取最近两天，使用[-2]获取昨天数据）
+                    detail = C.get_market_data_ex(['volume'], batch, period='1d', count=2, subscribe=False)
                     for stock in batch:
                         try:
-                            download_history_data(stock, '1d', start_date, end_date)
-                        except:
-                            pass
-                    detail = C.get_market_data_ex(['turnoverRate'], batch, period='1d', count=1, subscribe=False)
-                    for stock in batch:
-                        try:
-                            if stock in detail and len(detail[stock]) > 0:
-                                turnover = detail[stock]['turnoverRate'].iloc[-1] if not detail[stock]['turnoverRate'].empty else 0
-                                if turnover > 0:
-                                    turnover_dict[stock] = turnover
+                            # 获取流通股本
+                            instrument_detail = C.get_instrument_detail(stock)
+                            float_volume = instrument_detail.get('FloatVolume', 0)  # 流通股本
+                            
+                            if stock in detail and len(detail[stock]) >= 2:  # 确保至少有两天数据
+                                volume = detail[stock]['volume'].iloc[-2] if not detail[stock]['volume'].empty else 0
+                                
+                                # 计算换手率：成交量*100 / 流通股本
+                                if float_volume > 0 and volume > 0:
+                                    turnover_rate = (volume*100 / float_volume)
+                                    turnover_dict[stock] = turnover_rate
                                 else:
                                     turnover_error_count += 1
+                                    log_message("WARN", f"股票 {stock} 流通股本或成交量为0，无法计算换手率")
                             else:
                                 turnover_error_count += 1
                         except Exception as e:
@@ -668,6 +661,18 @@ def select_stocks(C):
         min_turnover = sorted_by_turnover[0][1]
         max_turnover = sorted_by_turnover[-1][1]
         log_message("INFO", f"换手率区间: {min_turnover:.4f}% - {max_turnover:.4f}%")
+        
+        # 显示换手率计算详情（使用昨天的数据）
+        log_message("DEBUG", "换手率计算详情（前5只股票，使用昨日数据）:")
+        for i, (stock, turnover) in enumerate(sorted_by_turnover[:5]):
+            try:
+                instrument_detail = C.get_instrument_detail(stock)
+                float_volume = instrument_detail.get('FloatVolume', 0)
+                detail = C.get_market_data_ex(['volume'], [stock], period='1d', count=2, subscribe=False)
+                volume = detail[stock]['volume'].iloc[-2] if stock in detail and len(detail[stock]) >= 2 else 0
+                log_message("DEBUG", f"  {stock}: 昨日成交量={volume:.0f}, 流通股本={float_volume:.0f}, 换手率={turnover:.4f}%")
+            except:
+                log_message("DEBUG", f"  {stock}: 换手率={turnover:.4f}% (详情获取失败)")
 
     # 第6步筛选：剔除不分红的股票
     log_message("INFO", "========== 第6步筛选：剔除不分红的股票 ==========")
