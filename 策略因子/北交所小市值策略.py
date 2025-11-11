@@ -17,6 +17,35 @@ def log_message(level, message):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] [{level}] {message}")
 
+def get_previous_trading_day():
+    """
+    获取前一个交易日
+    考虑周末和节假日，返回YYYYMMDD格式的字符串
+    """
+    import datetime
+    
+    today = datetime.datetime.now()
+    
+    # 根据今天是星期几来计算前一个交易日
+    if today.weekday() == 0:  # 今天是周一
+        # 前一个交易日是上周五（往前推3天）
+        prev_trading_day = today - datetime.timedelta(days=3)
+    elif today.weekday() == 6:  # 今天是周日
+        # 前一个交易日是周五（往前推2天）
+        prev_trading_day = today - datetime.timedelta(days=2)  
+    else:  # 今天是周二到周六
+        # 前一个交易日就是昨天
+        prev_trading_day = today - datetime.timedelta(days=1)
+        # 但如果昨天是周末，需要继续往前推
+        if prev_trading_day.weekday() == 5:  # 昨天是周六
+            prev_trading_day = prev_trading_day - datetime.timedelta(days=1)  # 推到周五
+        elif prev_trading_day.weekday() == 6:  # 昨天是周日  
+            prev_trading_day = prev_trading_day - datetime.timedelta(days=2)  # 推到周五
+    
+    result = prev_trading_day.strftime("%Y%m%d")
+    print(f"[DEBUG] 今天: {today.strftime('%Y-%m-%d %A')}, 计算出的前一交易日: {result} ({prev_trading_day.strftime('%Y-%m-%d %A')})")
+    return result
+
 def select_stocks(C):
     """
     北交所小市值多因子选股主函数
@@ -566,8 +595,9 @@ def select_stocks(C):
         max_pb = sorted_by_pb[-1][1]
         log_message("INFO", f"市净率区间: {min_pb:.2f} - {max_pb:.2f}")
 
-    # 第5步筛选：剔除换手率最高的30%
-    log_message("INFO", "========== 第5步筛选：剔除换手率最高的30% ==========")
+    # 第5步筛选：剔除前一天换手率最高的30%
+    log_message("INFO", "========== 第5步筛选：剔除前一天换手率最高的30% ==========")
+    
     step5_start = len(filtered)
     if step5_start == 0:
         log_message("WARN", "第4步筛选后无剩余股票，跳过后续筛选")
@@ -576,98 +606,234 @@ def select_stocks(C):
     turnover_dict = {}
     turnover_error_count = 0
     
-    log_message("INFO", f"开始获取 {step5_start} 只股票的换手率数据...")
+    log_message("INFO", f"开始获取 {step5_start} 只股票的前一天换手率数据...")
+    log_message("INFO", "使用官方 get_turnover_rate API 获取标准换手率数据")
     
-    # 先下载历史数据
+    # 显示所有股票的前一天换手率
+    print("=" * 85)
+    print("股票代码    股票名称        前一天换手率(%)    数据来源")
+    print("=" * 85)
+    
+    # 计算前一个交易日
+    import datetime
+    prev_trading_day = get_previous_trading_day()
+    log_message("INFO", f"计算前一交易日: {prev_trading_day}")
+    
+    # 使用官方get_turnover_rate API获取换手率
+    # 根据网页API文档：ContextInfo.get_turnover_rate(stock_list, startTime, endTime) -> pandas DataFrame
     try:
-        import datetime
-        end_date = datetime.datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y%m%d")
+        log_message("INFO", f"调用 C.get_turnover_rate({len(filtered)} 只股票, {prev_trading_day}, {prev_trading_day})")
+        turnover_data = C.get_turnover_rate(filtered, prev_trading_day, prev_trading_day)
         
-        download_stocks = filtered[:100] if step5_start > 100 else filtered
-        for stock in download_stocks:
-            try:
-                download_history_data(stock, '1d', start_date, end_date)
-            except Exception as e:
-                log_message("WARN", f"下载股票 {stock} 换手率历史数据失败: {str(e)}")
-        log_message("DEBUG", "成功下载换手率计算所需的历史数据")
-    except Exception as e:
-        log_message("WARN", f"下载换手率历史数据失败: {str(e)}")
-    
-    # 批量获取换手率数据
-    try:
-        if step5_start <= 100:  # 小批量直接获取
-            detail = C.get_market_data_ex(['turnoverRate'], filtered, period='1d', count=1, subscribe=False)
+        if turnover_data is not None and hasattr(turnover_data, 'empty') and not turnover_data.empty:
+            log_message("INFO", f"成功获取换手率数据，数据形状: {turnover_data.shape}")
+            log_message("DEBUG", f"换手率数据列名: {list(turnover_data.columns)}")
+            log_message("DEBUG", f"换手率数据索引类型: {type(turnover_data.index)}")
+            
+            # 显示数据样例（前3行）
+            if len(turnover_data) > 0:
+                log_message("DEBUG", f"换手率数据样例:\n{turnover_data.head(3)}")
+            
+            # 处理每只股票的换手率数据
             for stock in filtered:
                 try:
-                    if stock in detail and len(detail[stock]) > 0:
-                        turnover = detail[stock]['turnoverRate'].iloc[-1] if not detail[stock]['turnoverRate'].empty else 0
-                        if turnover > 0:
-                            turnover_dict[stock] = turnover
+                    stock_name = C.get_stock_name(stock)
+                    stock_turnover = None
+                    
+                    # 根据API文档，返回的是DataFrame，尝试不同的数据访问方式
+                    
+                    # 方法1：如果股票代码作为索引（最常见情况）
+                    if stock in turnover_data.index:
+                        stock_row = turnover_data.loc[stock]
+                        if hasattr(stock_row, 'iloc') and len(stock_row) > 0:
+                            # 如果返回Series，取第一个值
+                            stock_turnover = stock_row.iloc[0]
                         else:
+                            # 如果返回单个值
+                            stock_turnover = stock_row
+                    
+                    # 方法2：如果股票代码作为列名
+                    elif stock in turnover_data.columns:
+                        stock_data = turnover_data[stock]
+                        if hasattr(stock_data, 'iloc') and len(stock_data) > 0:
+                            stock_turnover = stock_data.iloc[0]  # 取第一行数据
+                        else:
+                            stock_turnover = stock_data
+                    
+                    # 方法3：查找包含股票代码的列或索引
+                    else:
+                        # 先尝试查找列名中包含股票代码的
+                        found = False
+                        for col in turnover_data.columns:
+                            if stock in str(col):
+                                stock_data = turnover_data[col]
+                                stock_turnover = stock_data.iloc[0] if hasattr(stock_data, 'iloc') and len(stock_data) > 0 else stock_data
+                                found = True
+                                break
+                        
+                        # 如果没找到对应列，尝试按顺序匹配（假设返回数据与股票列表顺序一致）
+                        if not found:
+                            try:
+                                stock_idx = filtered.index(stock)
+                                if stock_idx < len(turnover_data):
+                                    stock_row = turnover_data.iloc[stock_idx]
+                                    # 取第一个数值列的值
+                                    for col in turnover_data.columns:
+                                        if turnover_data[col].dtype in ['float64', 'int64', 'float32', 'int32']:
+                                            stock_turnover = stock_row[col]
+                                            break
+                            except (ValueError, IndexError):
+                                pass
+                    
+                    # 处理获取到的换手率数据
+                    if stock_turnover is not None:
+                        try:
+                            turnover_float = float(stock_turnover)
+                            
+                            # 数据有效性检查和单位转换
+                            if turnover_float >= 0:
+                                # 根据网页API文档示例，换手率一般以小数形式返回（如0.010809）
+                                # 转换为百分比显示
+                                if turnover_float <= 1:
+                                    # 已经是小数形式，转换为百分比
+                                    turnover_percent = turnover_float * 100
+                                elif turnover_float <= 100:
+                                    # 已经是百分比形式
+                                    turnover_percent = turnover_float
+                                else:
+                                    # 可能是万分之几，转换为百分比
+                                    turnover_percent = turnover_float / 100
+                                
+                                turnover_dict[stock] = turnover_percent
+                                print(f"{stock:<10} {stock_name:<12} {turnover_percent:>15.4f} {'官方API':>12}")
+                            else:
+                                log_message("WARN", f"股票 {stock} 换手率为负数: {stock_turnover}")
+                                print(f"{stock:<10} {stock_name:<12} {'负数异常':>15} {'异常':>12}")
+                                turnover_error_count += 1
+                                
+                        except (ValueError, TypeError):
+                            log_message("WARN", f"股票 {stock} 换手率转换异常: {stock_turnover}")
+                            print(f"{stock:<10} {stock_name:<12} {'转换异常':>15} {'异常':>12}")
                             turnover_error_count += 1
                     else:
+                        log_message("WARN", f"股票 {stock} 无换手率数据")
+                        print(f"{stock:<10} {stock_name:<12} {'无数据':>15} {'异常':>12}")
                         turnover_error_count += 1
+                        
                 except Exception as e:
-                    log_message("WARN", f"获取股票 {stock} 换手率时异常: {str(e)}")
+                    log_message("ERROR", f"处理股票 {stock} 换手率数据时异常: {str(e)}")
+                    try:
+                        stock_name = C.get_stock_name(stock)
+                    except:
+                        stock_name = 'Unknown'
+                    print(f"{stock:<10} {stock_name:<12} {'处理异常':>15} {'异常':>12}")
                     turnover_error_count += 1
+                    
         else:
-            # 大批量分批处理
-            batch_size = 50
-            for i in range(0, step5_start, batch_size):
-                batch = filtered[i:i+batch_size]
-                log_message("DEBUG", f"处理换手率数据批次: {i//batch_size + 1}/{(step5_start-1)//batch_size + 1}")
-                try:
-                    # 先下载这批股票的历史数据
-                    import datetime
-                    end_date = datetime.datetime.now().strftime("%Y%m%d")
-                    start_date = (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y%m%d")
-                    for stock in batch:
-                        try:
-                            download_history_data(stock, '1d', start_date, end_date)
-                        except:
-                            pass
-                    detail = C.get_market_data_ex(['turnoverRate'], batch, period='1d', count=1, subscribe=False)
-                    for stock in batch:
-                        try:
-                            if stock in detail and len(detail[stock]) > 0:
-                                turnover = detail[stock]['turnoverRate'].iloc[-1] if not detail[stock]['turnoverRate'].empty else 0
-                                if turnover > 0:
-                                    turnover_dict[stock] = turnover
-                                else:
-                                    turnover_error_count += 1
-                            else:
-                                turnover_error_count += 1
-                        except Exception as e:
-                            log_message("WARN", f"处理股票 {stock} 换手率数据时异常: {str(e)}")
-                            turnover_error_count += 1
-                except Exception as e:
-                    log_message("ERROR", f"批量获取换手率数据时异常: {str(e)}")
-                    turnover_error_count += len(batch)
+            log_message("WARN", "get_turnover_rate 返回空数据或格式异常，使用备用计算方法")
+            raise Exception("Empty or invalid DataFrame from get_turnover_rate")
                     
     except Exception as e:
-        log_message("ERROR", f"获取换手率数据时发生异常: {str(e)}")
-        return
+        log_message("ERROR", f"调用官方 get_turnover_rate API 失败: {str(e)}")
+        log_message("WARN", "使用备用方法：成交量÷流通股本计算换手率...")
+        
+        # 备用方法：使用成交量和流通股本计算换手率
+        for stock in filtered:
+            try:
+                stock_name = C.get_stock_name(stock)
+                
+                # 获取前一天成交量
+                volume_data = C.get_market_data_ex(['volume'], [stock], period='1d', count=2, subscribe=False)
+                
+                if stock in volume_data and len(volume_data[stock]) >= 2:
+                    volume_series = volume_data[stock]['volume']
+                    if len(volume_series) >= 2:
+                        prev_volume = volume_series.iloc[-2]  # 前一天成交量（手）
+                        
+                        if prev_volume is not None and prev_volume > 0:
+                            try:
+                                # 获取流通股本（股）
+                                float_shares = C.get_last_volume(stock)
+                                
+                                if float_shares and float_shares > 0:
+                                    # 计算标准换手率 = 成交股数 / 流通股本 * 100%
+                                    prev_volume_shares = float(prev_volume) * 100  # 成交量从手转换为股
+                                    turnover_rate = (prev_volume_shares / float(float_shares)) * 100
+                                    
+                                    turnover_dict[stock] = turnover_rate
+                                    print(f"{stock:<10} {stock_name:<12} {turnover_rate:>15.4f} {'成交量÷股本':>12}")
+                                else:
+                                    # 无法获取流通股本，使用相对成交量指标
+                                    volume_indicator = float(prev_volume) / 1000  # 千手为单位的相对流动性
+                                    turnover_dict[stock] = volume_indicator
+                                    print(f"{stock:<10} {stock_name:<12} {volume_indicator:>15.4f} {'成交量指标':>12}")
+                                    
+                            except Exception as calc_e:
+                                log_message("WARN", f"计算股票 {stock} 换手率失败: {str(calc_e)}")
+                                print(f"{stock:<10} {stock_name:<12} {'计算失败':>15} {'异常':>12}")
+                                turnover_error_count += 1
+                        else:
+                            print(f"{stock:<10} {stock_name:<12} {'成交量为0':>15} {'异常':>12}")
+                            turnover_error_count += 1
+                    else:
+                        print(f"{stock:<10} {stock_name:<12} {'数据不足':>15} {'异常':>12}")
+                        turnover_error_count += 1
+                else:
+                    print(f"{stock:<10} {stock_name:<12} {'无成交量':>15} {'异常':>12}")
+                    turnover_error_count += 1
+                    
+            except Exception as backup_e:
+                log_message("WARN", f"备用方法处理股票 {stock} 失败: {str(backup_e)}")
+                try:
+                    stock_name = C.get_stock_name(stock)
+                except:
+                    stock_name = 'Unknown'
+                print(f"{stock:<10} {stock_name:<12} {'备用失败':>15} {'异常':>12}")
+                turnover_error_count += 1
+    
+    print("=" * 85)
     
     if turnover_error_count > 0:
         log_message("WARN", f"有 {turnover_error_count} 只股票换手率数据异常")
     
     if not turnover_dict:
-        log_message("ERROR", "所有股票换手率数据都异常，无法继续筛选")
-        return
-    
-    # 按换手率排序，剔除最高的30%
-    sorted_by_turnover = sorted(turnover_dict.items(), key=lambda x: x[1])  
-    cut_num = max(1, int(len(sorted_by_turnover) * 0.3))
-    filtered = [stock for stock, turnover in sorted_by_turnover[:-cut_num]]
-    
-    step5_end = len(filtered)
-    log_message("INFO", f"第5步筛选结果: {step5_start} -> {step5_end} (剔除 {cut_num} 只)")
-    
-    if sorted_by_turnover:
-        min_turnover = sorted_by_turnover[0][1]
-        max_turnover = sorted_by_turnover[-1][1]
-        log_message("INFO", f"换手率区间: {min_turnover:.4f}% - {max_turnover:.4f}%")
+        log_message("ERROR", "所有股票换手率数据都异常，跳过第5步筛选")
+        step5_end = step5_start
+        log_message("INFO", f"第5步筛选结果: {step5_start} -> {step5_end} (跳过换手率筛选)")
+    else:
+        # 按换手率排序，剔除最高的30%
+        sorted_by_turnover = sorted(turnover_dict.items(), key=lambda x: x[1])  
+        cut_num = max(1, int(len(sorted_by_turnover) * 0.3))
+        removed_stocks = sorted_by_turnover[-cut_num:]
+        filtered = [stock for stock, turnover in sorted_by_turnover[:-cut_num]]
+        
+        step5_end = len(filtered)
+        log_message("INFO", f"第5步筛选结果: {step5_start} -> {step5_end} (剔除 {cut_num} 只)")
+        
+        # 显示换手率区间和被剔除的股票
+        if sorted_by_turnover:
+            min_turnover = sorted_by_turnover[0][1]
+            max_turnover = sorted_by_turnover[-1][1]
+            cut_turnover = sorted_by_turnover[-cut_num-1][1] if cut_num < len(sorted_by_turnover) else max_turnover
+            
+            # 判断数据类型
+            using_backup_method = max_turnover > 50  # 换手率通常不会超过50%，成交量指标可能很大
+            unit_desc = "（成交量万手）" if using_backup_method else "%"
+            
+            log_message("INFO", f"换手率区间: {min_turnover:.4f}{unit_desc} - {max_turnover:.4f}{unit_desc}")
+            log_message("INFO", f"筛选阈值: {cut_turnover:.4f}{unit_desc}")
+            
+            # 显示被剔除的高换手率股票
+            if removed_stocks:
+                log_message("DEBUG", "被剔除的换手率最高的30%股票:")
+                for stock, turnover in removed_stocks:
+                    try:
+                        stock_name = C.get_stock_name(stock)
+                        indicator_desc = f"{turnover:.4f}{unit_desc.strip('（）')}" 
+                        log_message("DEBUG", f"  {stock} {stock_name} (流动性指标: {indicator_desc})")
+                    except Exception as e:
+                        indicator_desc = f"{turnover:.4f}{unit_desc.strip('（）')}"
+                        log_message("DEBUG", f"  {stock} 获取名称失败 (流动性指标: {indicator_desc})")
 
     # 第6步筛选：剔除不分红的股票
     log_message("INFO", "========== 第6步筛选：剔除不分红的股票 ==========")
